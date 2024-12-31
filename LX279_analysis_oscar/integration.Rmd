@@ -1,0 +1,890 @@
+---
+title: "multimodal_srat"
+author: "yo"
+date: "2024-09-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+#Loading libraries
+```{r}
+library(SCutils)
+library(Matrix)  # needed for working with sparse matrices
+library(Seurat)
+library(ggplot2)
+library(dplyr)  # general data manipulation
+library(patchwork)  # composing multi-panel plots
+library(org.Hs.eg.db)  # genome information
+library(ggpubr)
+library(Polychrome)
+library(GO.db)
+library(ggraph)
+library(clustree)
+library(SingleR)
+library(pheatmap)
+library(infercnv)
+library(celldex)
+library(scDblFinder)
+library(clusterProfiler)
+library(tidyverse)
+library(enrichR)
+library(reshape2)
+library(SeuratObject)
+library(cowplot)
+library(dplyr)
+```
+
+#CFG
+List for parameters that we will use later on
+```{r}
+CFG <- list()  # global
+
+CFG$data_dir <- "~/nanopore_souporcell"  # where to read data from
+CFG$output_dir <- "~/nanopore_souporcell"  # where to write data to
+CFG$project <- "library name or brief annotation of lib"
+
+# explained later:
+CFG$ndims <- 20
+CFG$random_seed <- 2033
+CFG$reso <- 1.6
+
+# Cutoffs used during quality control for filtering genes
+# (explained later)
+CFG$min_txpts <- 1000
+CFG$max_txpts <- 23000
+CFG$max_pctmito <- 10
+
+# Graphical parameters
+CFG$gradient.colors <- viridis::viridis(101, direction = -1)
+
+#For SNVs
+CFG$QUAL <- 30 #Higher than 30
+CFG$ndims.snvs <- 25
+CFG$reso.snv <- 1.8
+CFG$reso.snv.p0 <- 1.4
+CFG$reso.snv.p1 <- 1.8
+CFG$ndims.p0 <- 14
+CFG$ndims.p1 <- 25
+CFG$ndims.tumor <- 15
+CFG$reso.ge.p0 <-
+CFG$reso.ge.p1 <- 1.4
+```
+
+#Loading data
+```{r}
+lib <- "LX279"  # name of the library, also needed later on.
+dir <- paste0(CFG$data_dir, "/", lib)  # what is actually on disk
+counts <- read.delim(
+  paste0(
+    CFG$data_dir,
+    "/LX279_sup_complete.gene_expression.counts.tsv"
+  ),
+  row.names = 1
+) #we do processing ourselves
+counts <- as.matrix(counts)
+counts <- as(counts, "sparseMatrix")
+#is of type 'dgCMatrix', a sparse matrix
+cnts_per_cell <- Matrix::colSums(counts)  # note use of Matrix::colSums
+
+summary(cnts_per_cell)
+```
+
+```{r}
+df <- data.frame(counts = cnts_per_cell)
+
+ggplot(df, aes(x = counts)) + geom_density() + geom_rug() +
+  scale_x_continuous(trans = "log2")
+
+## Changing cell labels
+cellnames <- colnames(counts)
+colnames(counts) <- paste0(lib, "_", cellnames)
+```
+
+#Metadata
+```{r}
+## Metadata
+# get the mitochondrial genes based on their name:
+mitos <- grep("^mt-",
+              rownames(counts),
+              value = TRUE,
+              ignore.case = TRUE)
+
+## show them:
+mitos
+##  [1] "MT-ND1"  "MT-ND2"  "MT-CO1"  "MT-CO2"  "MT-ATP8"
+#"MT-ATP6" "MT-CO3"  "MT-ND3"  "MT-ND4L" "MT-ND4"  "MT-ND5"  "MT-ND6"  "MT-CYB"
+
+percent_mito <- 100 * Matrix::colSums(counts[mitos, ]) / cnts_per_cell
+# note the use of Matrix::colSums again
+
+## get the non-mito's for easy selection of 'the rest of
+## the genes'
+nuclear <- setdiff(rownames(counts), mitos)
+
+log2_transcript_counts <- log2(1 + Matrix::colSums(counts[nuclear, ]))
+
+log2_feature_counts <- log2(1 + Matrix::colSums(counts[nuclear, ] > 0))
+
+## set up a data.frame:
+meta <- data.frame(
+  percent_mito = percent_mito,
+  log2_counts = log2_transcript_counts,
+  log2_features = log2_feature_counts,
+  lib = rep(lib, ncol(counts))
+)
+```
+
+#Create Seurat Object
+```{r}
+## let's show how features ( = genes ) relate to number of
+## transcripts
+ggplot(meta, aes(x = log2_counts, y = log2_features)) + geom_point(color = "blue")
+
+## Creating Seurat object ----
+counts <- counts[nuclear, ]
+
+srat <- Seurat::CreateSeuratObject(counts = counts,
+                                   project = CFG$project,
+                                   meta = meta)
+## Warning: Feature names cannot have underscores ('_'),
+#replacing with dashes ('-'). This doesn't happen with nano data
+
+## Later this we won't use the counts object anymore, so we
+## should get rid of it and cleanup
+rm(counts)
+gc()
+##used   (Mb) gc trigger   (Mb)   max used    (Mb)
+#Ncells   9666999  516.3   17059325  911.1   17059325   911.1
+#Vcells 185968360 1418.9  639368077 4878.0 2373940874 18111.8
+srat
+#An object of class Seurat
+#24740 features across 3821 samples within 1 assay
+#Active assay: RNA (24740 features, 0 variable features)
+
+head(srat@meta.data)
+```
+
+#Removing doublets
+```{r}
+##Removing doublets ----
+#Barcode name is without the library name, so we have to add it
+#Souporcell with ONT, requires vcf with scNano
+sop_nano <- read.delim("~/sop_input/nuc/clusters.tsv",
+                       header = TRUE,
+                       row.names = 1)
+rownames(sop_nano) <- paste0(lib, "_", rownames(sop_nano))
+rownames(sop_nano) <- gsub("-1", "", rownames(sop_nano), fixed = TRUE)
+
+goodBc <- rownames(sop_nano)[rownames(sop_nano) %in% colnames(srat)]
+
+srat@meta.data[goodBc, 'patient_ont'] <- sop_nano[goodBc, 'assignment']
+srat@meta.data[goodBc, 'status'] <- sop_nano[goodBc, 'status']
+
+srat <- subset(srat, subset = status == "singlet")
+
+##Souporcell with Ilmn (if available)
+sop_ilmn <- read.delim("~/clusters_k2_ilmn.tsv",
+                       header = TRUE,
+                       row.names = 1)
+rownames(sop_ilmn) <- paste0("LX279_", rownames(sop_ilmn))
+rownames(sop_ilmn) <- gsub('-1', '', rownames(sop_ilmn))
+
+goodBc <- rownames(sop_ilmn)[rownames(sop_ilmn) %in% colnames(srat)]
+
+srat@meta.data[goodBc, 'patient_ilmn'] <- sop_ilmn[goodBc, 'assignment']
+srat$patient_ilmn <- recode(srat$patient_ilmn, `0` = "1", `1` = "0")
+
+#if available, check overlap
+table(srat$patient_ont, srat$patient_ilmn)
+```
+
+###Filtering cells
+Based on transcripts
+```{r}
+#Filtering cells ----
+##Transcript counts ----
+v <- VlnPlot(srat, "nCount_RNA", group.by = "lib")
+lines <- seq(from = 0, to = 36000, by = 2000)
+hlines <- geom_hline(
+  yintercept = lines,
+  col = "grey",
+  linetype = 1,
+  lwd = 0.1
+)
+
+v + hlines
+v + scale_y_continuous(trans = "log2") + hlines
+
+## create a scatter graph
+f_lin <-
+  FeatureScatter(srat,
+                 feature1 = "nCount_RNA",
+                 feature2 = "nFeature_RNA",
+                 pt.size = 0.5) + geom_hline(yintercept = CFG$max_pctmito, linetype = 2) +
+  geom_vline(xintercept = c(CFG$min_txpts, CFG$max_txpts),
+             linetype = 2)
+f_lin
+##nCount_RNA simply means number of RNA transcripts.
+##In contrast, nFeature_RNA (used below) means: number of genes expressed
+##(regardless of the number of transcripts per gene)
+
+## also show the transcripts in logarithmic scale:
+
+f_log <- f_lin + scale_x_continuous(trans = "log2") + scale_y_continuous(trans = "log2")
+
+f_lin | f_log
+```
+
+###Based on mitochondrial pct
+```{r}
+##Mitochondrial content ----
+v <- VlnPlot(srat, "percent_mito", group.by = "lib")
+mitolines <- seq(from = 0, to = 100, by = 5)
+mitohlines <-
+  geom_hline(
+    yintercept = mitolines,
+    col = "grey",
+    linetype = 1,
+    lwd = 0.1
+  )
+v + mitohlines
+
+##Final selection ----
+## actually set the cutoffs (best done at the beginning of
+## your scripts to keep things tidy)
+## plot this:
+
+f <-
+  FeatureScatter(srat,
+                 feature1 = "nCount_RNA",
+                 feature2 = "percent_mito",
+                 pt.size = 1) + geom_hline(yintercept = CFG$max_pctmito, linetype = 2) +
+  geom_vline(xintercept = c(CFG$min_txpts, CFG$max_txpts),
+             linetype = 2)
+
+f
+f + scale_x_continuous(trans = "log2")
+
+## show how many cells will we discard by applying the
+## selection:
+dim(srat)
+#[1] 24740  3599
+dim(subset(srat, nCount_RNA < CFG$min_txpts))
+## [1] 24740   99
+dim(subset(srat, nCount_RNA > CFG$max_txpts))
+## [1] 24740   50
+dim(subset(srat, percent_mito > CFG$max_pctmito))
+## [1] 24740   316
+
+## lastly, subset the seurat object and save if needed
+srat <- subset(
+  srat,
+  subset = nCount_RNA >= CFG$min_txpts & nCount_RNA <=
+    CFG$max_txpts & percent_mito <= CFG$max_pctmito
+)
+
+dim(srat)
+##[1] 24740  3557
+```
+
+
+#Hemoglobin removal
+```{r}
+data(refdata_cellranger_GRCh38_3.0.0)
+
+hb_genes <- genelists$hemo
+## alternatively: hb_genes <- lookup.hemogenes()
+
+hb_genes <- intersect(hb_genes, rownames(srat))
+
+hb_counts <- Matrix::colSums(srat@assays$RNA$counts[hb_genes, ])
+
+srat <- AddMetaData(srat, col.name = "log2hb_genes", metadata = log2(1 + hb_counts))
+
+srat <- AddMetaData(
+  srat,
+  col.name = "pct_hemo",
+  metadata = 100 *
+    hb_counts / srat@meta.data$nCount_RNA
+)
+
+## now show the previous plot along side a plot of the hemo
+## content:
+df <- subset(srat@meta.data)
+
+p_ngenes <- ggplot(df, aes(x = log2_counts, y = log2_features, color = pct_hemo)) + geom_point(size = 1, alpha = 1 /
+                                                                                                 2) +
+  scale_color_gradient(
+    low = "blue",
+    high = "red",
+    limits = c(0, 5),
+    oob = scales::squish
+  )
+
+p_pcthemo <- ggplot(df, aes(x = log2_counts, y = pct_hemo, color = log2_features)) +
+  geom_point(size = 1, alpha = 1 / 2) +
+  scale_color_gradient(
+    low = "blue",
+    high = "red",
+    limits = c(2, 16),
+    oob = scales::squish
+  )
+
+p_ngenes | p_pcthemo
+
+
+p <- ggplot(df, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  xlab("RNA Counts") +
+  ylab("Features") +
+  geom_point(size = 0.5, color = "red")
+p
+
+## and/or logarithmic:
+
+p + scale_x_continuous(trans = "log2") + scale_y_continuous(trans = "log2")
+#add anotation
+ggplot(srat@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  xlab("RNA Counts") +
+  ylab("Features") +
+  geom_point(size = 0.5, color = "red")
+
+CFG$max_pct_hemo <- 5
+
+dim(srat)
+## [1] 24740  3557
+dim(subset(srat, pct_hemo > CFG$max_pct_hemo))
+## [1] 24740    28
+srat <- subset(srat, pct_hemo <= CFG$max_pct_hemo)
+
+p_withouthemo <- ggplot(srat@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  xlab("RNA Counts") +
+  ylab("Features") +
+  geom_point(size = 0.5, color = "red")
+
+p | p_withouthemo
+```
+
+#Normalization
+```{r}
+## Saved srat
+#file <- paste0(CFG$output_dir, "/srat-cellsfiltered.rds")
+#saveRDS(file = file, srat)
+#srat <-readRDS(file)
+
+#Normalization and Dimensional Reduction ----
+srat <- NormalizeData(srat, normalization.method = "LogNormalize")
+
+srat <- ScaleData(srat, features = rownames(srat), verbose = FALSE)
+
+srat <- FindVariableFeatures(srat)
+
+
+srat <- suppressMessages(
+  SCTransform(
+    srat,
+    vars.to.regres = NULL,
+    vst.flavor = 'v2',
+    ## version that solved some problems
+    verbose = FALSE,
+    variable.features.n = 3000
+  )
+)
+```
+
+```{r}
+file <- paste0(CFG$output_dir, "/srat-aneuploidy.rds")
+srat <- readRDS(file=file)
+srat <- subset(srat, subset = reference == 'p1.tumor')
+```
+
+
+#Loading SNVs
+String manipulation and srat creation with both RNA and SNV
+```{r}
+#String manipulation for alt & ref. We want a matrix without row/colnames
+#and only counts as values
+alt <- read.table(file = '~/sop_input/alt.mtx', header = TRUE)
+alt$ID <- NULL
+alt <- alt %>% unite(col = 'SNV', CHROM:ALT, sep = ':')
+rownames(alt) <- alt$SNV
+rownames(alt) <- paste0('alt:', rownames(alt))
+alt$SNV <- NULL
+alt$QUAL <- alt[alt$QUAL > CFG$QUAL]
+alt$QUAL <- NULL
+alt <- as.matrix(alt)
+
+ref <- read.table(file = '~/sop_input/ref.mtx', header = TRUE)
+ref$ID <- NULL
+ref <- ref %>% unite(col = 'SNV', CHROM:ALT, sep = ':')
+rownames(ref) <- ref$SNV
+rownames(ref) <- paste0('ref:', rownames(ref))
+ref$SNV <- NULL
+ref <- ref[ref$QUAL > CFG$QUAL]
+ref$QUAL <- NULL
+ref <- as.matrix(ref)
+
+counts.per.cell <- (rbind(alt, ref))
+counts.per.cell <- as.matrix(counts.per.cell)
+
+#Only gonna use nuclear reads
+mitochondrial.snvs <- grepl("^alt:chrM|^ref:chrM", rownames(counts.per.cell))
+
+mito.matrix <- counts.per.cell[mitochondrial.snvs, ]
+nuc.matrix <- counts.per.cell[!mitochondrial.snvs, ]
+
+nuc.matrix <- nuc.matrix[, colnames(nuc.matrix) %in% gsub('LX279_', '', colnames(srat))]
+dim(nuc.matrix)
+```
+
+```{r}
+#Change name of colnames to make identical to seurat obj
+colnames(nuc.matrix) <- paste0('LX279_', colnames(nuc.matrix))
+
+# create a new assay to store ADT information
+snv_assay <- CreateAssay5Object(counts = nuc.matrix)
+
+# add this assay to the previously created Seurat object
+if (!"SNV" %in% names(srat)) {
+  srat[["SNV"]] <- snv_assay
+}
+if (exists("srat.transcript") && length(srat.transcript) == length(srat)) {
+  srat[['SCT_trans']] <- srat.transcript[["SCT"]]
+}
+# Validate that the object now contains multiple assays
+Assays(srat)
+```
+
+#Normalize for SNV assay
+```{r}
+DefaultAssay(srat) <- 'SNV'
+# we will use all ADT features for dimensional reduction
+# we set a dimensional reduction name to avoid overwriting the 
+VariableFeatures(srat) <- rownames(srat[["SNV"]])
+srat <- NormalizeData(srat, normalization.method = "LogNormalize")
+
+srat <- ScaleData(srat, features = rownames(srat), verbose = FALSE)
+
+srat <- FindVariableFeatures(srat)
+
+
+srat <- suppressMessages(
+  SCTransform(
+    srat,
+    assay = 'SNV',
+    new.assay.name = "SCT.snv",
+    vars.to.regres = NULL,
+    vst.flavor = 'v2',
+    ## version that solved some problems
+    verbose = FALSE,
+    variable.features.n = 3000
+  )
+)
+
+srat <- RunPCA(srat,
+               assay = 'SCT.snv',
+               reduction.name = "pca.snv",
+               reduction.key = 'PC.snv')
+```
+
+
+```{r}
+srat <- RunUMAP(srat, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+
+srat <- FindClusters(srat, graph.name = "wsnn", algorithm = 3, resolution = 1.4, verbose = FALSE)
+
+p1 <- DimPlot(srat, reduction = 'wnn.umap', label = TRUE, repel = TRUE, label.size = 2.5)
+p2 <- FeaturePlot(srat, reduction = 'wnn.umap', features = 'aneuploidy_score', label.size = 2.5)
+p1 + p2
+
+#See RNA weight
+ VlnPlot(srat, features = "SCT.weight", group.by = 'wsnn_res.1.4', sort = TRUE, pt.size = 0.1) +
+  NoLegend()
+```
+
+#RNA markers
+```{r}
+rna_markers <- FindAllMarkers(srat, assay = "SCT",
+  min.pct = 0.1,
+  logfc.threshold = log(1.5))
+
+rna_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10.rna_markers
+head(top10.rna_markers)
+```
+
+```{r}
+snv_markers <- FindAllMarkers(srat, assay = "SNV",
+  min.pct = 0.1,
+  logfc.threshold = log(1.5))
+
+snv_markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10.snv_markers
+head(top10.snv_markers)
+
+intersect(top10.rna_markers %>% filter(cluster == 5) %>% pull(gene), cc.genes$g2m.genes)
+```
+
+```{r}
+p5 <- FeaturePlot(srat, features = "rna_BIRC5",
+                  reduction = 'wnn.umap',slot = 'counts',
+                  cols = c("lightgrey","darkgreen"))
+p6 <- FeaturePlot(srat, features = "snv_alt:chr10:128119296:T:C", 
+                  reduction = 'wnn.umap') + labs(title = 'SNV')
+p5 | p6
+```
+
+#Srat transcript
+```{r}
+CFG <- list()  # global
+
+CFG$data_dir <- "~"  # where to read data from
+CFG$output_dir <- "~/analysis_nanopore_LX279/transcripts"  # where to write data to
+
+# explained later:
+CFG$ndims <- 14
+CFG$random_seed <- 2033
+# Cutoffs used during quality control for filtering genes
+# (explained later)
+CFG$min_txpts <- 200
+CFG$max_txpts <- 12000
+CFG$max_pctmito <- 23.5
+
+# Graphical parameters
+
+CFG$gradient.colors <- viridis::viridis(101, direction = -1)
+
+## NOTE: many colors change if the number of clusters
+## change, so they are not fixed here.
+lib <- "LX279"  # name of the library, also needed later on.
+dir <- paste0(CFG$data_dir, "/", lib)  # what is actually on disk
+counts <- read.delim("~/LX279_sup_complete.transcript_expression.counts.tsv",
+                     row.names=1)
+counts <- as.matrix(counts)
+counts <- as(counts, "sparseMatrix") 
+#is of type 'dgCMatrix', a sparse matrix
+cnts_per_cell <- Matrix::colSums(counts)  # note use of Matrix::colSums
+
+summary(cnts_per_cell)
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#253    1693    2500    3295    4010   24913 
+#lower than gene_expression somehow, doesnt count intronic 
+# and is more more restrictive than gene assignment
+
+df <- data.frame(counts = cnts_per_cell)
+
+ggplot(df, aes(x = counts)) + geom_density() + geom_rug() +
+  scale_x_continuous(trans = "log2")
+
+## Changing cell labels ----
+cellnames <- colnames(counts)
+colnames(counts) <- paste0(lib, "_", cellnames)
+
+
+## Metadata ----
+# with transcripts we have ensembl id, we can change it to HGNC (retrieved from biomart):
+ensembl_2_geneID <- read.delim("~/ensembl_2_geneID")
+dim(ensembl_2_geneID)
+#277105      2
+
+ensID <- as.vector(rownames(counts))
+length(ensID)
+# 65126
+
+
+ensembl_2_geneID_filtered <- ensembl_2_geneID[ensembl_2_geneID$Transcript.stable.ID %in% ensID, ]
+without_duplicates<-unique(ensembl_2_geneID_filtered$Transcript.stable.ID)
+duplicates<-which(duplicated(ensembl_2_geneID_filtered$Transcript.stable.ID))
+ensembl_2_geneID_filtered <- ensembl_2_geneID_filtered[-duplicates,]
+dim(ensembl_2_geneID_filtered)
+#[1] 64044     2
+
+#Some transcripts didnt have geneID
+unIDed_transcripts <- setdiff(ensID, ensembl_2_geneID_filtered$Transcript.stable.ID)
+length(unIDed_transcripts)
+#1082
+
+temp <- data.frame(unIDed_transcripts)
+temp[,'HGNC.symbol'] <- "" 
+colnames(temp) <- c("Transcript.stable.ID", "HGNC.symbol")
+ensembl_2_geneID_filtered <- data.frame(rbind(ensembl_2_geneID_filtered, temp))
+
+change<-function(x) {
+  if (x[2] == "") {
+    x[2] = "NA"
+    return(x)
+  }
+  return(x)
+}
+ensembl_2_geneID_filtered <- data.frame(t(apply(ensembl_2_geneID_filtered, 1, change)))
+ensembl_2_geneID_filtered <- ensembl_2_geneID_filtered %>%
+  arrange(Transcript.stable.ID)
+
+geneID_ensembl <- paste0(ensembl_2_geneID_filtered$HGNC.symbol, "_",
+                         ensembl_2_geneID_filtered$Transcript.stable.ID)
+
+rownames(counts) <- geneID_ensembl
+
+mitos <- grep("^mt-", rownames(counts), value = TRUE, ignore.case = TRUE)
+
+## show them:
+mitos
+#[1] "MT-ND3_ENST00000361227"  "MT-ND4L_ENST00000361335" "MT-ND4_ENST00000361381"  "MT-ND1_ENST00000361390" 
+#[5] "MT-ND2_ENST00000361453"  "MT-ND5_ENST00000361567"  "MT-CO1_ENST00000361624"  "MT-ND6_ENST00000361681" 
+#[9] "MT-CO2_ENST00000361739"  "MT-CYB_ENST00000361789"  "MT-ATP8_ENST00000361851" "MT-ATP6_ENST00000361899"
+#[13] "MT-CO3_ENST00000362079" 
+
+percent_mito <- 100 * Matrix::colSums(counts[mitos, ])/cnts_per_cell
+# note the use of Matrix::colSums again
+
+## get the non-mito's for easy selection of 'the rest of
+## the genes'
+nuclear <- setdiff(rownames(counts), mitos)
+
+log2_transcript_counts <- log2(1 + Matrix::colSums(counts[nuclear,]))
+
+log2_feature_counts <- log2(1 + Matrix::colSums(counts[nuclear,] > 0))
+
+## set up a data.frame:
+meta <- data.frame(percent_mito = percent_mito,
+                   log2_counts = log2_transcript_counts,
+                   log2_features = log2_feature_counts,
+                   lib = rep(lib, ncol(counts)))
+
+## let's show how features ( = genes ) relate to number of
+## transcripts
+ggplot(meta, aes(x = log2_counts, y = log2_features)) + geom_point(color = "blue")
+
+## Creating Seurat object ----
+counts <- counts[nuclear, ]
+
+srat.transcript <- Seurat::CreateSeuratObject(counts = counts, project = "nanopore",
+                                   meta = meta)
+## Warning: Feature names cannot have underscores ('_'), 
+#replacing with dashes ('-'). This doesn't happen with nano data
+
+## Later this we won't use the counts object anymore, so we
+## should get rid of it and cleanup
+rm(counts)
+gc()
+##used   (Mb) gc trigger   (Mb)   max used    (Mb)
+#Ncells   9666999  516.3   17059325  911.1   17059325   911.1
+#Vcells 185968360 1418.9  639368077 4878.0 2373940874 18111.8
+srat.transcript
+#An object of class Seurat 
+#65113 features across 3821 samples within 1 assay
+#Active assay: RNA (65113 features, 0 variable features)
+
+#Much less features than illumina (36588 against 24740, roughly 14k less)
+head(srat.transcript@meta.data)
+
+##Removing doublets ----
+#Barcode name is without the library name, so we have to add it
+sop_nano <- read.delim("~/sop_input/nuc/clusters.tsv",
+                       header = TRUE,
+                       row.names = 1)
+rownames(sop_nano) <- paste0(lib, "_", rownames(sop_nano))
+rownames(sop_nano) <- gsub("-1", "", rownames(sop_nano), fixed = TRUE)
+
+goodBc <- rownames(sop_nano)[rownames(sop_nano) %in% colnames(srat.transcript)]
+
+srat.transcript@meta.data[goodBc, 'patient_ont'] <- sop_nano[goodBc, 'assignment']
+srat.transcript@meta.data[goodBc, 'status'] <- sop_nano[goodBc, 'status']
+
+srat.transcript <- subset(srat.transcript, subset = status == "singlet")
+
+#Filtering cells ----
+##Transcript counts ----
+v <- VlnPlot(srat.transcript, "nCount_RNA", group.by = "lib")
+lines <- seq(from = 0, to = 36000, by = 250)
+hlines <- geom_hline(yintercept = lines, col = "grey", linetype = 1,
+                     lwd = 0.1)
+
+v + hlines
+v + scale_y_continuous(trans = "log2") + hlines
+
+## create a scatter graph
+f_lin <-
+  FeatureScatter(srat.transcript,
+                 feature1 = "nCount_RNA",
+                 feature2 = "nFeature_RNA",
+                 pt.size = 0.5) + geom_hline(yintercept = CFG$max_pctmito,
+                                             linetype = 2) +
+  geom_vline(xintercept = c(CFG$min_txpts, CFG$max_txpts),
+             linetype = 2)
+f_lin
+##nCount_RNA simply means number of RNA transcripts.
+##In contrast, nFeature_RNA (used below) means: number of genes expressed
+##(regardless of the number of transcripts per gene)
+
+## also show the transcripts in logarithmic scale:
+
+f_log <- f_lin + scale_x_continuous(trans = "log2") + scale_y_continuous(trans = "log2")
+
+f_lin | f_log 
+
+##Mitochondrial content ----
+v <- VlnPlot(srat.transcript, "percent_mito", group.by = "lib")
+mitolines <- seq(from = 0, to = 100, by = 5)
+mitohlines <-
+  geom_hline(
+    yintercept = mitolines,
+    col = "grey",
+    linetype = 1,
+    lwd = 0.1
+  )
+v + mitohlines
+
+##Final selection ----
+## actually set the cutoffs (best done at the beginning of
+## your scripts to keep things tidy)
+## plot this:
+
+f <-
+  FeatureScatter(srat.transcript,
+                 feature1 = "nCount_RNA",
+                 feature2 = "percent_mito",
+                 pt.size = 1) + geom_hline(yintercept = CFG$max_pctmito, linetype = 2) +
+  geom_vline(xintercept = c(CFG$min_txpts, CFG$max_txpts),
+             linetype = 2)
+
+f
+f + scale_x_continuous(trans = "log2")
+
+## show how many cells will we discard by applying the
+## selection:
+dim(srat.transcript)
+#[1] 65113  3599
+dim(subset(srat.transcript, nCount_RNA < CFG$min_txpts))
+## [1] 65113    48
+dim(subset(srat.transcript, nCount_RNA > CFG$max_txpts))
+## [1] 65113    34
+dim(subset(srat.transcript, percent_mito > CFG$max_pctmito))
+## [1] 65113   404
+
+## lastly, subset the seurat object and save if needed
+srat.transcript <- subset(srat.transcript, subset = nCount_RNA >= CFG$min_txpts & nCount_RNA <=
+                 CFG$max_txpts & percent_mito <= CFG$max_pctmito)
+
+dim(srat.transcript)
+##[1] 24740  3557
+
+#Hemoglobin removal (should it have been done before?) ----
+
+data(refdata_cellranger_GRCh38_3.0.0)
+
+hb_genes <- genelists$hemo
+hb_genes <- subset(ensembl_2_geneID_filtered, subset = HGNC.symbol %in% hb_genes)
+hb_genes <- paste0(hb_genes$HGNC.symbol, "-", hb_genes$Transcript.stable.ID)
+## alternatively: hb_genes <- lookup.hemogenes()
+
+hb_genes <- intersect(hb_genes, rownames(srat.transcript))
+
+hb_counts <- Matrix::colSums(srat.transcript@assays$RNA$counts[hb_genes,])
+
+srat.transcript <- AddMetaData(srat.transcript, col.name = "log2hb_genes",
+                    metadata = log2(1 + hb_counts))
+
+srat.transcript <- AddMetaData(srat.transcript, col.name = "pct_hemo", metadata = 100 *
+                      hb_counts/srat.transcript@meta.data$nCount_RNA)
+
+## now show the previous plot along side a plot of the hemo
+## content:
+df <- subset(srat.transcript@meta.data)
+
+p_ngenes <- ggplot(df, aes(x = log2_counts, y = log2_features,
+                           color = pct_hemo)) + geom_point(size = 1, alpha = 1/2) +
+  scale_color_gradient(
+    low = "blue",
+    high = "red",
+    limits = c(0,
+               5),
+    oob = scales::squish
+  )
+
+p_pcthemo <- ggplot(df, aes(x = log2_counts, y = pct_hemo,
+                            color = log2_features)) +
+  geom_point(size = 1, alpha = 1/2) +
+  scale_color_gradient(
+    low = "blue",
+    high = "red",
+    limits = c(2,
+               16),
+    oob = scales::squish
+  )
+
+p_ngenes | p_pcthemo
+
+p <- ggplot(df, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  xlab("RNA Counts")+
+  ylab("Features")+
+  geom_point(size=0.5, color="red")
+p
+
+## and/or logarithmic:
+
+p + scale_x_continuous(trans = "log2") + scale_y_continuous(trans = "log2")
+#add anotation
+ggplot(srat.transcript@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  xlab("RNA Counts")+
+  ylab("Features")+
+  geom_point(size=0.5, color="red")
+
+CFG$max_pct_hemo <- 5
+
+dim(srat.transcript)
+## [1] 65113  3161
+dim(subset(srat.transcript, pct_hemo > CFG$max_pct_hemo))
+## [1] 24740    28
+srat.transcript <- subset(srat.transcript, pct_hemo <= CFG$max_pct_hemo)
+
+p_withouthemo <- ggplot(srat.transcript@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  xlab("RNA Counts")+
+  ylab("Features")+
+  geom_point(size=0.5, color="red")
+
+p | p_withouthemo
+
+## Saved srat.transcript ----
+file <- paste0(CFG$output_dir, "/srat.transcript-cellsfiltered.rds")
+saveRDS(file = file, srat.transcript)
+#srat.transcript <-readRDS(file)
+
+#Normalization and Dimensional Reduction ----
+srat.transcript <- NormalizeData(srat.transcript, normalization.method = "LogNormalize")
+
+srat.transcript <- ScaleData(srat.transcript, features = rownames(srat.transcript), verbose = FALSE)
+
+srat.transcript <- FindVariableFeatures(srat.transcript)
+
+
+srat.transcript <- suppressMessages(SCTransform(srat.transcript, 
+                                     vars.to.regres=NULL,
+                                     vst.flavor='v2', ## version that solved some problems
+                                     verbose=FALSE,
+                                     variable.features.n=3000))
+
+```
+
+```{r}
+# Identify multimodal neighbors. These will be stored in the neighbors slot, 
+# and can be accessed using srat[['weighted.nn']]
+# The WNN graph can be accessed at srat[["wknn"]], 
+# and the SNN graph used for clustering at srat[["wsnn"]]
+# Cell-specific modality weights can be accessed at srat$RNA.weight
+srat <- FindMultiModalNeighbors(
+  srat, reduction.list = list("pca", "pca.snv"), 
+  dims.list = list(1:CFG$ndims, 1:CFG$ndims.p1), modality.weight.name = "RNA.weight"
+)
+```
