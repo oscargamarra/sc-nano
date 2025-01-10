@@ -11,7 +11,7 @@ TLDR of each file:
 - LX279_ONT_transcripts: isoform analysis using FULL LENGTH transcripts.
 - analysis_snvs_counts: unsupervised clustering with SNVs counts to deconvolve cells (demultiplexing and malignancy inference)
 - analysis_snvs_vafs: unsupervised clustering using SNVs VAFS (demultiplexing and malignancy inference)
-- changing.matrix: creates VAF matrix & ALT and REF counts matrices from scNanoGPS VCF
+- changing.matrix: AFTER RUNNING TRANSFORM_TO_MMF. Reformats MMF to Souporcell's format (changes -1 to 0 and adds extra info needed in the matrix)
 - figures.R: replicates figures used in Report
 - filtering_snvs_souporcell: filters SNVs for Souporcell's filtered alternative
 - ge+snv.pipeline: unified transcriptomic + SNV analysis
